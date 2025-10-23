@@ -920,9 +920,9 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
             continue
 
         # ----------------------------
-        # 选能量最大的通道，并分别处理“保存”和“发送”两条路径：
-        # - 保存：始终写入（除非处于暂停），确保文件时长与真实时长一致
-        # - 发送：仍受静音门限控制，避免把静音段发到识别端
+        # 选能量最大的通道用于“保存”；“发送”改为每个通道持续送流（包含静音）
+        # - 保存：始终将被选中通道写入（除非处于暂停），确保文件时长与真实时长一致
+        # - 发送：对每个通道持续发送到对应 ASR 连接，不再做静音阈值门控
         # per_channel_frames 中的 bytes 已是目标采样率 SAMPLE_RATE（例如 16k）
         # ----------------------------
         try:
@@ -968,27 +968,37 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
                 except Exception:
                     pass
 
-            # 2) 仅当超过静音门限时，才发送到识别端并记录到 ring buffer
-            if max_rms >= MIN_ACTIVE_RMS:
-                chunk_to_send = per_channel_frames[selected_ch]
-                if chunk_to_send:
-                    try:
-                        ring_buffers[selected_ch].append(chunk_to_send)
-                    except Exception:
-                        pass
+            # 2) 对每个通道：持续发送到识别端，并记录到 ring buffer（若配置了长度）
+            try:
+                num_channels_to_send = min(desired_ch, len(per_channel_frames))
+            except Exception:
+                num_channels_to_send = len(per_channel_frames)
 
-                    try:
-                        ws_conn = None
-                        if isinstance(ws_connections, list) and selected_ch < len(ws_connections):
-                            ws_conn = ws_connections[selected_ch]
-                        if ws_conn is not None:
-                            try:
-                                # 发送的 bytes 已是 SAMPLE_RATE 下的 PCM int16
-                                asyncio.run_coroutine_threadsafe(ws_conn.send(chunk_to_send), loop)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+            for ch in range(num_channels_to_send):
+                chunk_to_send = per_channel_frames[ch]
+                if not chunk_to_send:
+                    continue
+
+                # 记录短历史（若启用）
+                try:
+                    if isinstance(ring_buffers, list) and ch < len(ring_buffers) and ring_buffers[ch] is not None:
+                        ring_buffers[ch].append(chunk_to_send)
+                except Exception:
+                    pass
+
+                # 发送到对应通道的 ASR 连接
+                try:
+                    ws_conn = None
+                    if isinstance(ws_connections, list) and ch < len(ws_connections):
+                        ws_conn = ws_connections[ch]
+                    if ws_conn is not None:
+                        try:
+                            # 发送的 bytes 已是 SAMPLE_RATE 下的 PCM int16
+                            asyncio.run_coroutine_threadsafe(ws_conn.send(chunk_to_send), loop)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
         except Exception as e:
             print("[combined_reader] 选通道/发送/保存 处理异常:", e)

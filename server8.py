@@ -35,6 +35,11 @@ BASE_URL = config.get("BASE_URL", "ws://speech.xiaoyuzhineng.com:12392")
 SAMPLE_RATE = int(config.get("SAMPLE_RATE", 16000))
 FRAMES_PER_BUFFER = int(config.get("FRAMES_PER_BUFFER", 1280))
 
+# 通道选择平滑：滑动窗口长度与切换阈值
+# 当最近 SELECTION_SMOOTHING_WINDOW 个块中，某通道成为“瞬时最响”次数比例超过阈值时，才切换到该通道
+SELECTION_SMOOTHING_WINDOW = int(config.get("SELECTION_SMOOTHING_WINDOW", 30))
+SELECTION_SWITCH_THRESHOLD = float(config.get("SELECTION_SWITCH_THRESHOLD", 0.6))
+
 HOST_API_INDEX = config.get("HOST_API_INDEX", 0)
 DEVICE_NAMES = config.get("DEVICE_NAMES", [])
 

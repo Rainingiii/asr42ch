@@ -33,7 +33,7 @@ BASE_URL = config.get("BASE_URL", "ws://speech.xiaoyuzhineng.com:12392")
 
 # SAMPLE_RATE 既用于打开设备流的参考速率，也作为发送/保存前的目标采样率（例如 16000）
 SAMPLE_RATE = int(config.get("SAMPLE_RATE", 16000))
-FRAMES_PER_BUFFER = int(config.get("FRAMES_PER_BUFFER", 1280))
+FRAMES_PER_BUFFER = int(config.get("FRAMES_PER_BUFFER", 882))
 
 HOST_API_INDEX = config.get("HOST_API_INDEX", 0)
 DEVICE_NAMES = config.get("DEVICE_NAMES", [])
@@ -1088,3 +1088,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

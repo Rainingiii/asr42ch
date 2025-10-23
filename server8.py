@@ -920,9 +920,17 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
             continue
 
         # ----------------------------
-        # 选能量最大的通道并发送/保存：per_channel_frames 中的 bytes 已是 target SAMPLE_RATE（例如 16k）
+        # 选能量最大的通道，并分别处理“保存”和“发送”两条路径：
+        # - 保存：始终写入（除非处于暂停），确保文件时长与真实时长一致
+        # - 发送：仍受静音门限控制，避免把静音段发到识别端
+        # per_channel_frames 中的 bytes 已是目标采样率 SAMPLE_RATE（例如 16k）
         # ----------------------------
         try:
+            # 若处于暂停，既不保存也不发送
+            if recording_paused:
+                await asyncio.sleep(0)
+                continue
+
             rms_list = []
             for ch in range(min(desired_ch, len(per_channel_frames))):
                 chunk = per_channel_frames[ch]
@@ -946,9 +954,22 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
                 max_rms = 0.0
                 selected_ch = 0
 
-            if max_rms < MIN_ACTIVE_RMS:
-                await asyncio.sleep(0)
-            else:
+            # 1) 始终将被选中通道写入保存队列（保持文件时间轴完整）
+            chunk_to_save = per_channel_frames[selected_ch] if selected_ch < len(per_channel_frames) else b''
+            if selected_channel_queue is not None and chunk_to_save:
+                try:
+                    try:
+                        asyncio.run_coroutine_threadsafe(selected_channel_queue.put(chunk_to_save), loop)
+                    except Exception:
+                        try:
+                            await selected_channel_queue.put(chunk_to_save)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # 2) 仅当超过静音门限时，才发送到识别端并记录到 ring buffer
+            if max_rms >= MIN_ACTIVE_RMS:
                 chunk_to_send = per_channel_frames[selected_ch]
                 if chunk_to_send:
                     try:
@@ -964,18 +985,6 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
                             try:
                                 # 发送的 bytes 已是 SAMPLE_RATE 下的 PCM int16
                                 asyncio.run_coroutine_threadsafe(ws_conn.send(chunk_to_send), loop)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-                if selected_channel_queue is not None and chunk_to_send:
-                    try:
-                        try:
-                            asyncio.run_coroutine_threadsafe(selected_channel_queue.put(chunk_to_send), loop)
-                        except Exception:
-                            try:
-                                await selected_channel_queue.put(chunk_to_send)
                             except Exception:
                                 pass
                     except Exception:

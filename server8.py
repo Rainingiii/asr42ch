@@ -904,6 +904,9 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
     total_channels = sum(channel_counts)
     print(f"[combined_reader] total_channels = {total_channels}, channel_counts = {channel_counts}")
     # 如果 device_rates 中的某些设备采样率等于 SAMPLE_RATE，则对于这些设备不会进行重采样
+    # 滑动窗口平滑通道选择：维护最近若干块的“瞬时赢家”，仅在出现比例超过阈值时切换
+    winners_window = collections.deque(maxlen=SELECTION_SMOOTHING_WINDOW if SELECTION_SMOOTHING_WINDOW > 0 else 1)
+    current_selected_ch = 0
     while True:
         try:
             gets = [loop.run_in_executor(None, q.get) for q in device_queues]
@@ -954,10 +957,27 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
 
             if rms_list:
                 max_rms = max(rms_list)
-                selected_ch = int(np.argmax(np.array(rms_list)))
+                selected_ch = int(np.argmax(np.array(rms_list)))  # 瞬时赢家
             else:
                 max_rms = 0.0
-                selected_ch = 0
+                selected_ch = 0  # 瞬时赢家（无有效信号时退回 0）
+
+            # --- 滑动窗口平滑逻辑 ---
+            try:
+                instant_winner_ch = selected_ch
+                winners_window.append(instant_winner_ch)
+                # 仅当瞬时赢家在窗口内的占比超过阈值时，才切换到该通道
+                window_len = len(winners_window)
+                if window_len > 0:
+                    count_winner = winners_window.count(instant_winner_ch)
+                    ratio = count_winner / window_len
+                    if ratio >= SELECTION_SWITCH_THRESHOLD:
+                        current_selected_ch = instant_winner_ch
+                # 使用平滑后的通道作为本次发送/保存通道
+                selected_ch = current_selected_ch
+            except Exception:
+                # 任何异常下退回即时选择（保持鲁棒性）
+                pass
 
             # 1) 始终将被选中通道写入保存队列（保持文件时间轴完整）
             chunk_to_save = per_channel_frames[selected_ch] if selected_ch < len(per_channel_frames) else b''

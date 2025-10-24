@@ -820,7 +820,10 @@ def _sync_process_parts(parts, channel_counts, desired_ch_local, device_rates, t
     target_sr: 目标采样率（SAMPLE_RATE）
     返回:
       - pcm_bytes: interleaved int16 bytes（以 target_sr 为时间基准）
-      - per_channel_frames: list(len=desired_ch) 每项为该通道在 target_sr 下的连续 int16 bytes（大窗口）
+      - per_channel_frames: list，长度为 max(desired_ch_local, 1)。
+        每项为该通道在 target_sr 下的连续 int16 bytes（大窗口）。
+        注意：即使 desired_ch_local 为 0（例如未配置 API_KEYS），也会输出 1 个通道，
+        以保证始终有可保存的单声道音频，避免生成空数据的 WAV 文件。
     """
     import numpy as np
 
@@ -881,7 +884,13 @@ def _sync_process_parts(parts, channel_counts, desired_ch_local, device_rates, t
         else:
             pieces.append(m[:min_fc, :])
     frames_matrix = np.concatenate(pieces, axis=1)
-    frames_matrix = frames_matrix[:, :desired_ch_local]
+    # 确保至少保留 1 个通道用于保存（即使 desired_ch_local == 0）
+    try:
+        desired_ch_int = int(desired_ch_local)
+    except Exception:
+        desired_ch_int = 0
+    effective_ch = desired_ch_int if desired_ch_int > 0 else 1
+    frames_matrix = frames_matrix[:, :effective_ch]
 
     if frames_matrix.size == 0:
         return b'', [b'' for _ in range(desired_ch_local)]
@@ -890,8 +899,8 @@ def _sync_process_parts(parts, channel_counts, desired_ch_local, device_rates, t
     interleaved_pcm16 = (interleaved_pcm16 * 32767).astype(np.int16)
     pcm_bytes = interleaved_pcm16.tobytes()
 
-    per_channel_frames = [b'' for _ in range(desired_ch_local)]
-    for ch in range(desired_ch_local):
+    per_channel_frames = [b'' for _ in range(frames_matrix.shape[1])]
+    for ch in range(frames_matrix.shape[1]):
         col = interleaved_pcm16[:, ch]
         per_channel_frames[ch] = col.tobytes()
 

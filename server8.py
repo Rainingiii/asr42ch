@@ -13,6 +13,7 @@ import aiohttp
 import os
 import uuid
 import functools
+import math
 
 # ---------- 从 JSON 文件读取配置 ----------
 CONFIG_FILE = "config.json"
@@ -30,14 +31,15 @@ API_KEYS = config.get("API_KEYS", [])
 LANG = config.get("LANG", "zh")
 CONTINUOUS_DECODING = config.get("CONTINUOUS_DECODING", True)
 BASE_URL = config.get("BASE_URL", "ws://speech.xiaoyuzhineng.com:12392")
+UPLOAD_URL = config.get("UPLOAD_URL", "14.204.16.40:19877")
 
 # SAMPLE_RATE 既用于打开设备流的参考速率，也作为发送/保存前的目标采样率（例如 16000）
 SAMPLE_RATE = int(config.get("SAMPLE_RATE", 16000))
-FRAMES_PER_BUFFER = int(config.get("FRAMES_PER_BUFFER", 1280))
+FRAMES_PER_BUFFER = int(config.get("FRAMES_PER_BUFFER", 882))
 
 # 通道选择平滑：滑动窗口长度与切换阈值
 # 当最近 SELECTION_SMOOTHING_WINDOW 个块中，某通道成为“瞬时最响”次数比例超过阈值时，才切换到该通道
-SELECTION_SMOOTHING_WINDOW = int(config.get("SELECTION_SMOOTHING_WINDOW", 30))
+SELECTION_SMOOTHING_WINDOW = int(config.get("SELECTION_SMOOTHING_WINDOW", 20))
 SELECTION_SWITCH_THRESHOLD = float(config.get("SELECTION_SWITCH_THRESHOLD", 0.6))
 
 HOST_API_INDEX = config.get("HOST_API_INDEX", 0)
@@ -55,6 +57,8 @@ MIN_ACTIVE_RMS = float(config.get("MIN_ACTIVE_RMS", 0.0005))
 # 全局状态
 desired_ch = 0
 ring_buffers = []  # will be assigned in main()
+cache_buffers = []  # per-channel cache for flush-on-switch
+selected_once = []  # per-channel flag: whether this channel has been selected at least once
 results_storage: List[List[Dict[str, Any]]] = []
 connected_clients: Set = set()
 connected_clients_lock = None  # 在 main() 中初始化为 asyncio.Lock()
@@ -237,7 +241,7 @@ async def ws_server_handler(ws):
                         await safe_send(ws, {"type":"cmd_error","action":"resume_recording","msg":"当前没有正在进行的识别，无法恢复"} )
                         continue
                     if not recording_paused:
-                        await safe_send(ws, {"type":"cmd","action":"resume_recording","msg":"当前没有处于暂停状态"})
+                        await safe_send(ws, {"type":"cmd","action":"resume_recording","msg":"当前没有处于暂停状态"} )
                         continue
                     if pause_start_time is not None:
                         elapsed = time.time() - pause_start_time
@@ -249,11 +253,14 @@ async def ws_server_handler(ws):
 
                 elif action == "save_recording":
                     url = data.get("url")
+                    if url:
+                        url = url.replace("/api", "")
+                        url = f"{UPLOAD_URL}{url}"
                     the_id = data.get("id")
                     file_path = f"{session_id}.wav"
 
                     if not session_id or not url or not the_id or not os.path.exists(file_path):
-                        await safe_send(ws, {"type":"cmd_error","action":"save_recording","session_id":session_id,"msg":"参数缺失或文件不存在"})
+                        await safe_send(ws, {"type":"cmd_error","action":"save_recording","session_id":session_id,"msg":"参数缺失或文件不存在"} )
                         continue
 
                     await safe_send(ws, {
@@ -449,7 +456,7 @@ async def _safe_send(ws, text: str, to_remove: List):
 async def start_recognition(session_id: str):
     global recognition_active, recording_task, selected_channel_queue, recording_filename, start_time
     global recording_paused, pause_start_time, total_paused_duration, current_session_id
-    global channel_tasks, ws_connections, broadcast_queue, desired_ch
+    global channel_tasks, ws_connections, broadcast_queue, desired_ch, selected_once, cache_buffers
 
     if recognition_active:
         print("[ws server] 已有识别在进行中，忽略 start_recording")
@@ -481,6 +488,12 @@ async def start_recognition(session_id: str):
     if not isinstance(ws_connections, list) or len(ws_connections) < desired_ch:
         ws_connections = [None for _ in range(desired_ch)]
 
+    # 重置 selected_once（start 时确保为未选中状态）
+    try:
+        selected_once = [False for _ in range(desired_ch)]
+    except Exception:
+        selected_once = [False] * desired_ch
+
     # 清理旧 channel_tasks（如果存在）
     try:
         if isinstance(channel_tasks, list) and channel_tasks:
@@ -507,7 +520,7 @@ async def start_recognition(session_id: str):
 async def stop_recognition():
     global recognition_active, recording_task, selected_channel_queue, start_time, recording_filename
     global recording_paused, pause_start_time, total_paused_duration
-    global results_storage, ring_buffers, current_session_id, ws_connections, channel_tasks
+    global results_storage, ring_buffers, cache_buffers, current_session_id, ws_connections, channel_tasks, selected_once
 
     if not recognition_active:
         print("[ws server] 没有进行中的识别，忽略 stop_recording")
@@ -581,7 +594,17 @@ async def stop_recognition():
                 dq.clear()
             except Exception:
                 pass
-        print("[stop_recognition] 已清空 results_storage 与 ring_buffers")
+        for dq in cache_buffers:
+            try:
+                dq.clear()
+            except Exception:
+                pass
+        # reset selected_once
+        try:
+            selected_once = [False for _ in range(len(selected_once))]
+        except Exception:
+            selected_once = []
+        print("[stop_recognition] 已清空 results_storage 与 ring_buffers 与 cache_buffers 并重置 selected_once")
     except Exception as e:
         print("[stop_recognition] 清空本地识别结果/缓冲时异常:", e)
 
@@ -666,7 +689,7 @@ async def channel_worker_direct(chan_id: int, api_key: str, broadcast_queue: asy
                             if transcript.strip() == "嗯":
                                 continue
 
-                            print(f"[chan {chan_id}] 识别: {transcript} (time={ts_now}s)")
+                            print(f"[chan {chan_id}] {action}:识别: {transcript} (time={ts_now}s)")
                             try:
                                 await broadcast_queue.put({
                                     "type": "content",
@@ -900,13 +923,14 @@ def _sync_process_parts(parts, channel_counts, desired_ch_local, device_rates, t
 # ---------- 合并并处理来自多个 device 的帧（已将重型计算移入线程池） ----------
 async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts: List[int],
                                broadcast_queue: asyncio.Queue, loop, device_rates: List[int]):
-    global recognition_active, selected_channel_queue, desired_ch, recording_paused, ring_buffers, ws_connections
+    global recognition_active, selected_channel_queue, desired_ch, recording_paused, ring_buffers, cache_buffers, ws_connections, selected_once
     total_channels = sum(channel_counts)
     print(f"[combined_reader] total_channels = {total_channels}, channel_counts = {channel_counts}")
     # 如果 device_rates 中的某些设备采样率等于 SAMPLE_RATE，则对于这些设备不会进行重采样
     # 滑动窗口平滑通道选择：维护最近若干块的“瞬时赢家”，仅在出现比例超过阈值时切换
     winners_window = collections.deque(maxlen=SELECTION_SMOOTHING_WINDOW if SELECTION_SMOOTHING_WINDOW > 0 else 1)
     current_selected_ch = 0
+
     while True:
         try:
             gets = [loop.run_in_executor(None, q.get) for q in device_queues]
@@ -939,6 +963,7 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
                 await asyncio.sleep(0)
                 continue
 
+            # 计算每通道 RMS（用于瞬时赢家判断）
             rms_list = []
             for ch in range(min(desired_ch, len(per_channel_frames))):
                 chunk = per_channel_frames[ch]
@@ -956,28 +981,97 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
                     rms_list.append(0.0)
 
             if rms_list:
-                max_rms = max(rms_list)
-                selected_ch = int(np.argmax(np.array(rms_list)))  # 瞬时赢家
+                selected_ch_instant = int(np.argmax(np.array(rms_list)))  # 瞬时赢家
             else:
-                max_rms = 0.0
-                selected_ch = 0  # 瞬时赢家（无有效信号时退回 0）
+                selected_ch_instant = 0  # 无有效信号时退回 0
 
             # --- 滑动窗口平滑逻辑 ---
+            previous_selected = current_selected_ch
             try:
-                instant_winner_ch = selected_ch
-                winners_window.append(instant_winner_ch)
-                # 仅当瞬时赢家在窗口内的占比超过阈值时，才切换到该通道
+                winners_window.append(selected_ch_instant)
+                # 只有当瞬时赢家在窗口内的占比超过阈值时，才切换到该通道
                 window_len = len(winners_window)
                 if window_len > 0:
-                    count_winner = winners_window.count(instant_winner_ch)
+                    count_winner = winners_window.count(selected_ch_instant)
                     ratio = count_winner / window_len
                     if ratio >= SELECTION_SWITCH_THRESHOLD:
-                        current_selected_ch = instant_winner_ch
+                        current_selected_ch = selected_ch_instant
                 # 使用平滑后的通道作为本次发送/保存通道
                 selected_ch = current_selected_ch
             except Exception:
                 # 任何异常下退回即时选择（保持鲁棒性）
-                pass
+                selected_ch = selected_ch_instant
+                current_selected_ch = selected_ch_instant
+
+            # ---------- 检测到真正的切换：处理新选中通道的缓存 ----------
+            try:
+                if current_selected_ch != previous_selected:
+                    idx = current_selected_ch
+                    if isinstance(cache_buffers, list) and 0 <= idx < len(cache_buffers):
+                        # 如果是第一次被选中：**不 flush 不写入**，直接清空缓存并标记已选中
+                        if not (isinstance(selected_once, list) and idx < len(selected_once) and selected_once[idx]):
+                            # first time select: skip flushing and writing to selected_channel_queue
+                            try:
+                                selected_once[idx] = True
+                            except Exception:
+                                # ensure list length
+                                try:
+                                    selected_once = [False for _ in range(desired_ch)]
+                                    selected_once[idx] = True
+                                except Exception:
+                                    pass
+                            try:
+                                cache_buffers[idx].clear()
+                            except Exception:
+                                pass
+                            print(f"[combined_reader] 通道 {idx} 第一次被选中，已清空其缓存（不发送历史帧以避免重复）")
+                        else:
+                            # 非第一次：按旧逻辑 flush 缓存到保存队列与 ASR
+                            cached_items = list(cache_buffers[idx])  # snapshot（不含本循环的当前帧）
+                            if cached_items:
+                                print(f"[combined_reader] 检测到切换：{previous_selected} -> {current_selected_ch}，开始 flush 通道 {idx} 的缓存 (len={len(cached_items)})")
+                                try:
+                                    ws_conn = None
+                                    if isinstance(ws_connections, list) and idx < len(ws_connections):
+                                        ws_conn = ws_connections[idx]
+                                except Exception:
+                                    ws_conn = None
+
+                                # 逐帧按时间顺序发送：先写入保存队列（保持文件完整），再尝试发送到 ASR（如果存在）
+                                for chunk in cached_items:
+                                    if not chunk:
+                                        continue
+                                    # 写入保存队列（非阻塞）
+                                    try:
+                                        try:
+                                            asyncio.run_coroutine_threadsafe(selected_channel_queue.put(chunk), loop)
+                                        except Exception:
+                                            try:
+                                                await selected_channel_queue.put(chunk)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+
+                                    # 发送到 ASR（若有连接）
+                                    if ws_conn is not None:
+                                        try:
+                                            closed = getattr(ws_conn, "closed", False)
+                                        except Exception:
+                                            closed = False
+                                        if not closed:
+                                            try:
+                                                await ws_conn.send(chunk)
+                                            except Exception:
+                                                pass
+                                # 清空缓存（已 flush）
+                                try:
+                                    cache_buffers[idx].clear()
+                                except Exception:
+                                    pass
+                                print(f"[combined_reader] flush 完成: 通道 {idx}")
+            except Exception as e:
+                print("[combined_reader] flush 缓存异常:", e)
 
             # 1) 始终将被选中通道写入保存队列（保持文件时间轴完整）
             chunk_to_save = per_channel_frames[selected_ch] if selected_ch < len(per_channel_frames) else b''
@@ -993,7 +1087,7 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
                 except Exception:
                     pass
 
-            # 2) 仅将“能量最大”的通道持续发送到识别端，并记录到该通道的 ring buffer（若启用）
+            # 2) 仅将“能量最大”的通道持续发送到识别端，并记录到 ring_buffers（用于可视化/短历史）以及追加到 cache_buffers（为将来可能的切换保存历史）
             try:
                 chunk_to_send = per_channel_frames[selected_ch]
             except Exception:
@@ -1007,19 +1101,31 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
                 except Exception:
                     pass
 
-                # 发送到对应通道的 ASR 连接
+                # 发送到对应通道的 ASR 连接（非阻塞）
                 try:
                     ws_conn = None
                     if isinstance(ws_connections, list) and selected_ch < len(ws_connections):
                         ws_conn = ws_connections[selected_ch]
                     if ws_conn is not None:
                         try:
-                            # 发送的 bytes 已是 SAMPLE_RATE 下的 PCM int16
                             asyncio.run_coroutine_threadsafe(ws_conn.send(chunk_to_send), loop)
                         except Exception:
                             pass
                 except Exception:
                     pass
+
+            # 最后：将每个通道本次的帧追加到对应 cache_buffers（为未来可能的切换保存历史）
+            try:
+                for ch in range(min(desired_ch, len(per_channel_frames))):
+                    c = per_channel_frames[ch]
+                    if not c:
+                        continue
+                    try:
+                        cache_buffers[ch].append(c)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         except Exception as e:
             print("[combined_reader] 选通道/发送/保存 处理异常:", e)
@@ -1027,7 +1133,7 @@ async def combined_reader_loop(device_queues: List[queue.Queue], channel_counts:
 # ---------- 主流程 ----------
 async def main():
     global results_storage, desired_ch, ws_connections, channel_tasks, broadcast_queue, connected_clients_lock
-    global ring_buffers
+    global ring_buffers, cache_buffers, selected_once
     p = pyaudio.PyAudio()
     server = None
     try:
@@ -1062,7 +1168,11 @@ async def main():
 
         # 初始化结构
         results_storage = [[] for _ in range(desired_ch)]
+        # 计算每个通道用于 flush 的缓存长度（基于滑动窗口与阈值），至少保留 1 块
+        cache_len = max(1, int(math.ceil(SELECTION_SMOOTHING_WINDOW * SELECTION_SWITCH_THRESHOLD)))
         ring_buffers = [collections.deque(maxlen=RING_BUFFER_MAXLEN) for _ in range(desired_ch)]
+        cache_buffers = [collections.deque(maxlen=cache_len) for _ in range(desired_ch)]
+        selected_once = [False for _ in range(desired_ch)]
         ws_connections = [None for _ in range(desired_ch)]
         broadcast_queue = asyncio.Queue()
         loop = asyncio.get_running_loop()

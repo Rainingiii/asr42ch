@@ -13,6 +13,7 @@ import aiohttp
 import os
 import uuid
 import functools
+import re
 
 # ---------- 从 JSON 文件读取配置 ----------
 CONFIG_FILE = "config.json"
@@ -127,6 +128,12 @@ async def save_selected_channel_audio(selected_queue: asyncio.Queue, filename: s
     wf.setnchannels(1)
     wf.setsampwidth(2)
     wf.setframerate(rate)
+    # 明确设置为未压缩 PCM，增强兼容性（尤其 Windows 播放器）
+    try:
+        wf.setcomptype('NONE', 'not compressed')
+    except Exception:
+        # 某些 Python 版本内部已默认设置，无需强制
+        pass
     print(f"[save-selected] 开始保存单声道（被选中通道）音频到 {filename} (rate={rate})")
     try:
         while True:
@@ -148,6 +155,42 @@ async def save_selected_channel_audio(selected_queue: asyncio.Queue, filename: s
         except Exception:
             pass
         print(f"[save-selected] 已保存并关闭：{filename}")
+        # 关闭后做一次快速头部校验与日志输出，便于跨平台排查
+        try:
+            with wave.open(filename, 'rb') as rf:
+                ch = rf.getnchannels()
+                sw = rf.getsampwidth()
+                fr = rf.getframerate()
+                nf = rf.getnframes()
+                dur = (nf / fr) if fr > 0 else 0.0
+                print(f"[save-selected] 校验 WAV: channels={ch}, sampwidth={sw}, rate={fr}, frames={nf}, duration={dur:.2f}s")
+        except Exception as e:
+            print(f"[save-selected] 校验 WAV 失败: {e}")
+
+# ---------- 工具：生成跨平台安全的文件名（兼容 Windows） ----------
+def make_windows_safe_filename(name: str) -> str:
+    """
+    将任意字符串转换为适用于跨平台（尤其 Windows）的安全文件名。
+    - 替换 Windows 保留字符: < > : " / \ | ? *
+    - 去除首尾空格与点
+    - 若为空则回退为 safe
+    - 限制长度到 240 字符（为后缀与路径留余量）
+    """
+    if name is None:
+        name = ""
+    # 替换保留字符
+    name = re.sub(r'[<>:"/\\|?*]+', '_', str(name))
+    # 去除首尾空格与点
+    name = name.strip().strip('.')
+    if not name:
+        name = "safe"
+    # 避免以点或空格结尾
+    while name and (name[-1] == ' ' or name[-1] == '.'):
+        name = name[:-1]
+    # 长度限制
+    if len(name) > 240:
+        name = name[:240]
+    return name
 
 # ---------- WebSocket server（控制 start/stop/pause/resume/save, 增加 update_hotwords） ----------
 async def ws_server_handler(ws):
@@ -208,7 +251,7 @@ async def ws_server_handler(ws):
                         "type": "cmd",
                         "action": "start_recording_confirmed",
                         "session_id": session_id,
-                        "msg": f"start_recording_confirmed! 保存为文件 {current_session_id}.wav"
+                        "msg": f"start_recording_confirmed! 保存为文件 {recording_filename}"
                     })
 
                 elif action == "stop_recording":
@@ -250,7 +293,8 @@ async def ws_server_handler(ws):
                 elif action == "save_recording":
                     url = data.get("url")
                     the_id = data.get("id")
-                    file_path = f"{session_id}.wav"
+                    # 统一使用实际生成的文件名，避免因非法文件名或不一致导致找不到文件
+                    file_path = recording_filename if recording_filename else f"{session_id}.wav"
 
                     if not session_id or not url or not the_id or not os.path.exists(file_path):
                         await safe_send(ws, {"type":"cmd_error","action":"save_recording","session_id":session_id,"msg":"参数缺失或文件不存在"})
@@ -464,8 +508,9 @@ async def start_recognition(session_id: str):
     pause_start_time = None
     total_paused_duration = 0.0
 
-    # 改为包含 uuid 的文件名，避免覆盖
-    recording_filename = f"{current_session_id}.wav"
+    # 使用跨平台安全文件名，避免 Windows 因保留字符无法打开
+    safe_base = make_windows_safe_filename(current_session_id)
+    recording_filename = f"{safe_base}.wav"
 
     # 创建 selected_channel_queue 并启动写入任务（只保存被选中通道）
     selected_channel_queue = asyncio.Queue()
